@@ -6,4 +6,8 @@ services:
     startCommand: python server.py
     envVars:
       - key: AUTH_TOKEN
-        generateValue: true      # Render auto-generates a secret value
+        generateValue: true
+      - key: GITHUB_TOKEN
+        sync: false              # Set this manually in the Render dashboard
+      - key: GITHUB_REPO
+        sync: false              # e.g. yourusername/claude-notes-data
