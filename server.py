@@ -6,6 +6,7 @@ Notes are stored in a GitHub repo for persistence across Render deploys.
 
 import os
 import asyncio
+from contextlib import asynccontextmanager
 from github import Github, GithubException
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -172,7 +173,16 @@ async def oauth_register(request: Request) -> JSONResponse:
 
 mcp_app = mcp.streamable_http_app()
 
+@asynccontextmanager
+async def lifespan(app):
+    # FastMCP's streamable_http_app has its own lifespan that initialises the
+    # session manager's task group. We must run it here or every MCP request
+    # will raise "Task group is not initialized".
+    async with mcp_app.router.lifespan_context(mcp_app):
+        yield
+
 app = Starlette(
+    lifespan=lifespan,
     routes=[
         Route("/health", endpoint=health),
         Route("/.well-known/oauth-protected-resource", endpoint=oauth_resource_metadata),
