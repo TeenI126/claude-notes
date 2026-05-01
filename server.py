@@ -132,8 +132,8 @@ async def delete_file(filename: str) -> str:
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        # Always allow health check and OAuth discovery through
-        if path == "/health" or path.startswith("/.well-known"):
+        # Always allow health check, OAuth discovery, and registration through
+        if path == "/health" or path.startswith("/.well-known") or path == "/register":
             return await call_next(request)
         if not AUTH_TOKEN:
             return await call_next(request)
@@ -154,8 +154,21 @@ async def oauth_resource_metadata(request: Request) -> JSONResponse:
     """Tell Claude's connector this server uses simple bearer tokens."""
     return JSONResponse({
         "resource": SERVER_URL,
+        "authorization_servers": [SERVER_URL],
         "bearer_methods_supported": ["header", "query"],
     })
+
+async def oauth_auth_server_metadata(request: Request) -> JSONResponse:
+    """Minimal auth server metadata — no token or authorization endpoint,
+    so Claude gives up on OAuth and falls back to the bearer token it already has."""
+    return JSONResponse({
+        "issuer": SERVER_URL,
+        "registration_endpoint": f"{SERVER_URL}/register",
+    })
+
+async def oauth_register(request: Request) -> JSONResponse:
+    """Accept dynamic client registration so Claude doesn't get a hard error."""
+    return JSONResponse({"client_id": "mcp-client", "client_id_issued_at": 0}, status_code=201)
 
 mcp_app = mcp.streamable_http_app()
 
@@ -163,6 +176,8 @@ app = Starlette(
     routes=[
         Route("/health", endpoint=health),
         Route("/.well-known/oauth-protected-resource", endpoint=oauth_resource_metadata),
+        Route("/.well-known/oauth-authorization-server", endpoint=oauth_auth_server_metadata),
+        Route("/register", endpoint=oauth_register, methods=["POST"]),
         Mount("/", app=mcp_app),
     ]
 )
