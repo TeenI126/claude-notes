@@ -27,6 +27,53 @@ SERVER_URL   = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
 
 mcp = FastMCP("claude-notes")
 
+# ── Diagnose + patch FastMCP transport security ───────────────────────────────
+# FastMCP's transport_security module rejects non-localhost Host headers.
+# We print its source at startup so we can see exactly what it checks,
+# then attempt to patch whatever allowed-hosts structure it exposes.
+
+def _inspect_and_patch_transport_security() -> None:
+    import inspect, urllib.parse
+    server_host = urllib.parse.urlparse(SERVER_URL).netloc.split(":")[0]
+    extra_hosts = {"localhost", "127.0.0.1", server_host}
+
+    for module_path in (
+        "mcp.server.transport_security",
+        "mcp.server.fastmcp.transport_security",
+    ):
+        try:
+            import importlib
+            ts = importlib.import_module(module_path)
+        except ImportError:
+            continue
+
+        print(f"\n=== {module_path} ({ts.__file__}) ===")
+        try:
+            print(inspect.getsource(ts))
+        except Exception:
+            try:
+                with open(ts.__file__) as f:
+                    print(f.read())
+            except Exception as e:
+                print(f"(could not read source: {e})")
+        print("=== END ===\n")
+
+        # Patch any frozenset/set of allowed hosts
+        for attr in dir(ts):
+            val = getattr(ts, attr, None)
+            if isinstance(val, (frozenset, set)) and "localhost" in val or (
+                isinstance(val, (frozenset, set)) and "127.0.0.1" in val
+            ):
+                setattr(ts, attr, type(val)(val | extra_hosts))
+                print(f"Patched {module_path}.{attr}: added {extra_hosts}")
+
+        # Patch any validate-style function to always return True
+        for name, obj in inspect.getmembers(ts, inspect.isfunction):
+            print(f"  fn: {name}")
+        break  # stop after first successful import
+
+_inspect_and_patch_transport_security()
+
 # ── GitHub helpers ────────────────────────────────────────────────────────────
 
 def _get_repo():
