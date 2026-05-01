@@ -130,6 +130,16 @@ async def delete_file(filename: str) -> str:
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
+def _set_host_localhost(request: Request) -> None:
+    """Rewrite the Host header to 'localhost' so FastMCP's transport security
+    check passes. FastMCP only whitelists localhost by default; for Render
+    deployments the real host would otherwise trigger a 421."""
+    request.scope["headers"] = [
+        (k, b"localhost" if k.lower() == b"host" else v)
+        for k, v in request.scope["headers"]
+    ]
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -137,6 +147,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path == "/health" or path.startswith("/.well-known") or path == "/register":
             return await call_next(request)
         if not AUTH_TOKEN:
+            _set_host_localhost(request)
             return await call_next(request)
         token = (
             request.query_params.get("token", "")
@@ -144,6 +155,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         )
         if token != AUTH_TOKEN:
             return Response("Unauthorized", status_code=401)
+        _set_host_localhost(request)
         return await call_next(request)
 
 # ── App assembly ──────────────────────────────────────────────────────────────
