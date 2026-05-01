@@ -25,7 +25,7 @@ import uvicorn
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-NOTES_DIR = Path(os.environ.get("NOTES_DIR", "/data/notes"))
+NOTES_DIR = Path(os.environ.get("NOTES_DIR", "/opt/render/project/src/notes"))
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")  # Set this in Render env vars!
 
 # ── Startup ───────────────────────────────────────────────────────────────────

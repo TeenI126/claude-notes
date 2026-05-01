@@ -7,9 +7,3 @@ services:
     envVars:
       - key: AUTH_TOKEN
         generateValue: true      # Render auto-generates a secret value
-      - key: NOTES_DIR
-        value: /data/notes
-    disk:
-      name: notes-storage
-      mountPath: /data
-      sizeGB: 1                  # 1 GB is plenty; free tier supports this
