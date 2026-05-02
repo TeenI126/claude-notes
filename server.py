@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from github import Github, GithubException
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.routing import Route, Mount
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
@@ -150,23 +150,46 @@ async def delete_file(filename: str) -> str:
             raise
     return await asyncio.to_thread(_run)
 
-# ── Auth middleware ───────────────────────────────────────────────────────────
+# ── Auth middleware (pure ASGI — no buffering, SSE-safe) ─────────────────────
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        # Always allow health check, OAuth discovery, and registration through
-        if path == "/health" or path.startswith("/.well-known") or path == "/register":
-            return await call_next(request)
+class AuthMiddleware:
+    """Pure ASGI middleware so it doesn't interfere with SSE streaming.
+    BaseHTTPMiddleware buffers responses and breaks the MCP streamable-HTTP
+    transport's SSE negotiation (causes 406 Not Acceptable)."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        # Always allow health check and OAuth discovery through
+        if path == "/health" or path.startswith("/.well-known"):
+            await self.app(scope, receive, send)
+            return
+
+        # No token configured → open access
         if not AUTH_TOKEN:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
+
+        # Extract token from query string or Authorization header
+        request = Request(scope)
         token = (
             request.query_params.get("token", "")
             or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
         )
+
         if token != AUTH_TOKEN:
-            return Response("Unauthorized", status_code=401)
-        return await call_next(request)
+            response = Response("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
 
 # ── App assembly ──────────────────────────────────────────────────────────────
 
