@@ -16,6 +16,28 @@ from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
 import uvicorn
 
+# ── Disable FastMCP's DNS-rebinding transport security ────────────────────────
+# FastMCP wraps the streamable HTTP endpoint with TransportSecurityMiddleware
+# configured for localhost-only access (allowed_hosts=["localhost:*"]).
+# On Render the Host header is the public domain, which gets rejected as 421.
+# Our AuthMiddleware already handles authentication, so we disable the
+# DNS-rebinding check entirely by patching the middleware at import time.
+
+from mcp.server.transport_security import (
+    TransportSecurityMiddleware,
+    TransportSecuritySettings,
+)
+
+_original_ts_init = TransportSecurityMiddleware.__init__
+
+def _init_no_dns_rebinding(self, settings=None):
+    _original_ts_init(
+        self,
+        TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+
+TransportSecurityMiddleware.__init__ = _init_no_dns_rebinding
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 AUTH_TOKEN   = os.environ.get("AUTH_TOKEN", "")
@@ -26,53 +48,6 @@ SERVER_URL   = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
 # ── FastMCP ───────────────────────────────────────────────────────────────────
 
 mcp = FastMCP("claude-notes")
-
-# ── Diagnose + patch FastMCP transport security ───────────────────────────────
-# FastMCP's transport_security module rejects non-localhost Host headers.
-# We print its source at startup so we can see exactly what it checks,
-# then attempt to patch whatever allowed-hosts structure it exposes.
-
-def _inspect_and_patch_transport_security() -> None:
-    import inspect, urllib.parse
-    server_host = urllib.parse.urlparse(SERVER_URL).netloc.split(":")[0]
-    extra_hosts = {"localhost", "127.0.0.1", server_host}
-
-    for module_path in (
-        "mcp.server.transport_security",
-        "mcp.server.fastmcp.transport_security",
-    ):
-        try:
-            import importlib
-            ts = importlib.import_module(module_path)
-        except ImportError:
-            continue
-
-        print(f"\n=== {module_path} ({ts.__file__}) ===")
-        try:
-            print(inspect.getsource(ts))
-        except Exception:
-            try:
-                with open(ts.__file__) as f:
-                    print(f.read())
-            except Exception as e:
-                print(f"(could not read source: {e})")
-        print("=== END ===\n")
-
-        # Patch any frozenset/set of allowed hosts
-        for attr in dir(ts):
-            val = getattr(ts, attr, None)
-            if isinstance(val, (frozenset, set)) and "localhost" in val or (
-                isinstance(val, (frozenset, set)) and "127.0.0.1" in val
-            ):
-                setattr(ts, attr, type(val)(val | extra_hosts))
-                print(f"Patched {module_path}.{attr}: added {extra_hosts}")
-
-        # Patch any validate-style function to always return True
-        for name, obj in inspect.getmembers(ts, inspect.isfunction):
-            print(f"  fn: {name}")
-        break  # stop after first successful import
-
-_inspect_and_patch_transport_security()
 
 # ── GitHub helpers ────────────────────────────────────────────────────────────
 
@@ -177,16 +152,6 @@ async def delete_file(filename: str) -> str:
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
-def _set_host_localhost(request: Request) -> None:
-    """Rewrite the Host header to 'localhost' so FastMCP's transport security
-    check passes. FastMCP only whitelists localhost by default; for Render
-    deployments the real host would otherwise trigger a 421."""
-    request.scope["headers"] = [
-        (k, b"localhost" if k.lower() == b"host" else v)
-        for k, v in request.scope["headers"]
-    ]
-
-
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -194,7 +159,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path == "/health" or path.startswith("/.well-known") or path == "/register":
             return await call_next(request)
         if not AUTH_TOKEN:
-            _set_host_localhost(request)
             return await call_next(request)
         token = (
             request.query_params.get("token", "")
@@ -202,7 +166,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         )
         if token != AUTH_TOKEN:
             return Response("Unauthorized", status_code=401)
-        _set_host_localhost(request)
         return await call_next(request)
 
 # ── App assembly ──────────────────────────────────────────────────────────────
@@ -211,32 +174,18 @@ async def health(request: Request) -> Response:
     return Response("ok")
 
 async def oauth_resource_metadata(request: Request) -> JSONResponse:
-    """Tell Claude's connector this server uses simple bearer tokens."""
+    """Tell Claude this resource accepts bearer tokens directly.
+    No authorization_servers — Claude will skip the OAuth flow and fall back
+    to using the bearer token already present in the connector URL."""
     return JSONResponse({
         "resource": SERVER_URL,
-        "authorization_servers": [SERVER_URL],
         "bearer_methods_supported": ["header", "query"],
     })
-
-async def oauth_auth_server_metadata(request: Request) -> JSONResponse:
-    """Minimal auth server metadata — no token or authorization endpoint,
-    so Claude gives up on OAuth and falls back to the bearer token it already has."""
-    return JSONResponse({
-        "issuer": SERVER_URL,
-        "registration_endpoint": f"{SERVER_URL}/register",
-    })
-
-async def oauth_register(request: Request) -> JSONResponse:
-    """Accept dynamic client registration so Claude doesn't get a hard error."""
-    return JSONResponse({"client_id": "mcp-client", "client_id_issued_at": 0}, status_code=201)
 
 mcp_app = mcp.streamable_http_app()
 
 @asynccontextmanager
 async def lifespan(app):
-    # FastMCP's streamable_http_app has its own lifespan that initialises the
-    # session manager's task group. We must run it here or every MCP request
-    # will raise "Task group is not initialized".
     async with mcp_app.router.lifespan_context(mcp_app):
         yield
 
@@ -245,8 +194,6 @@ app = Starlette(
     routes=[
         Route("/health", endpoint=health),
         Route("/.well-known/oauth-protected-resource", endpoint=oauth_resource_metadata),
-        Route("/.well-known/oauth-authorization-server", endpoint=oauth_auth_server_metadata),
-        Route("/register", endpoint=oauth_register, methods=["POST"]),
         Mount("/", app=mcp_app),
     ]
 )
