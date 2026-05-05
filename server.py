@@ -205,6 +205,37 @@ async def oauth_resource_metadata(request: Request) -> JSONResponse:
         "bearer_methods_supported": ["header", "query"],
     })
 
+async def rest_write(request: Request) -> JSONResponse:
+    """Simple REST endpoint called by Apple Shortcuts to write a file.
+    POST /write?token=YOUR_TOKEN
+    Body: {"filename": "reminders.md", "content": "...markdown..."}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    filename = _safe_filename(body.get("filename", ""))
+    content = body.get("content", "")
+
+    if not filename:
+        return JSONResponse({"error": "missing or invalid filename"}, status_code=400)
+
+    def _run():
+        repo = _get_repo()
+        try:
+            existing = repo.get_contents(filename)
+            repo.update_file(filename, f"Update {filename}", content, existing.sha)
+        except GithubException as e:
+            if e.status == 404:
+                repo.create_file(filename, f"Create {filename}", content)
+            else:
+                raise
+        return f"Written {len(content)} chars to '{filename}'."
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse({"ok": True, "detail": result})
+
 mcp_app = mcp.streamable_http_app()
 
 @asynccontextmanager
@@ -217,6 +248,7 @@ app = Starlette(
     routes=[
         Route("/health", endpoint=health),
         Route("/.well-known/oauth-protected-resource", endpoint=oauth_resource_metadata),
+        Route("/write", endpoint=rest_write, methods=["POST"]),
         Mount("/", app=mcp_app),
     ]
 )
