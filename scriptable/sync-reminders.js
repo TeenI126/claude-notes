@@ -1,21 +1,37 @@
 // ── Two-Way Apple Reminders ↔ Claude Sync ────────────────────────────────────
-// Paste into Scriptable (scriptable.app).  Automate via:
-//   Shortcuts → Automation → Time of Day → Run Scriptable Script
+// Automate via: Shortcuts → Automation → Time of Day → Run Scriptable Script
 //
-// Flow:
-//   1. GET  /reminders/sync  → fetch completions Claude made + reminders Claude added
-//   2. Apply completions on iOS, create additions on iOS
-//   3. POST /reminders/sync  → push full current state back to the server
+// Reads AUTH_TOKEN from config.json in the Scriptable iCloud folder.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Config (edit these) ──────────────────────────────────────────────────────
+// ── Config ───────────────────────────────────────────────────────────────────
 
 const SERVER_URL = "https://myclaude-n8nn.onrender.com"
-const AUTH_TOKEN = "YOUR_AUTH_TOKEN_HERE"
 const NOTIFY     = true
 
 // Filter to specific lists (empty = all lists)
-const ONLY_LISTS = []
+const ONLY_LISTS = ["Reminders"]
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+try {
+
+// ── Load config ───────────────────────────────────────────────────────────────
+
+const fm         = FileManager.iCloud()
+const configPath = fm.joinPath(fm.documentsDirectory(), "config.json")
+
+if (!fm.fileExists(configPath)) {
+  throw new Error("config.json not found in the Scriptable iCloud folder.")
+}
+
+await fm.downloadFileFromiCloud(configPath)
+const config     = JSON.parse(fm.readString(configPath))
+const AUTH_TOKEN = config.AUTH_TOKEN
+
+if (!AUTH_TOKEN || AUTH_TOKEN.startsWith("YOUR_")) {
+  throw new Error("AUTH_TOKEN is not set in config.json")
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 1: Fetch pending work from the server
@@ -48,7 +64,6 @@ console.log(
 const confirmedCompletions = []
 
 if (pendingCompletions.length > 0) {
-  // Fetch ALL reminders (including completed) so we can find by ID
   const allReminders = await Reminder.allIncomplete()
 
   for (const pc of pendingCompletions) {
@@ -60,7 +75,6 @@ if (pendingCompletions.length > 0) {
     } else {
       console.log(`Already completed/deleted on Apple: ${pc.identifier}`)
     }
-    // Confirm either way so the server clears it
     confirmedCompletions.push(pc.identifier)
   }
 }
@@ -84,7 +98,6 @@ if (pendingAdditions.length > 0) {
     }
     if (pa.priority != null) r.priority = pa.priority
 
-    // Try to place in the requested list
     if (pa.list_name) {
       const target = calendars.find(c => c.title === pa.list_name)
       if (target) r.calendar = target
@@ -155,7 +168,7 @@ const summary =
 console.log(`Sync complete: ${summary}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 6: Notify
+// Step 6: Notify on success
 // ─────────────────────────────────────────────────────────────────────────────
 
 if (NOTIFY) {
@@ -165,4 +178,15 @@ if (NOTIFY) {
   await n.schedule()
 }
 
+} catch (err) {
+  console.error(`Sync failed: ${err.message}`)
+  if (NOTIFY) {
+    const n  = new Notification()
+    n.title  = "Reminders sync failed"
+    n.body   = err.message
+    await n.schedule()
+  }
+}
+
+// Always call Script.complete() so Shortcuts automation doesn't hang
 Script.complete()
