@@ -65,12 +65,6 @@ Once connected, you can tell Claude things like:
 - *"Add an entry to jobs.md: Shopify, Data Scientist, applied May 1"*
 - *"Read my jobs.md file"*
 - *"Update the status of the Shopify application to 'interview scheduled'"*
+- *"Hey Claudsicle, add a reminder to get cheese."*
 
 ---
-
-## Notes
-
-- Files are stored on Render's persistent disk (`/data/notes`)
-- Free tier may have ~30s cold start if the server hasn't been used recently
-- Only `.` prefixed filenames are blocked (for safety); everything else is allowed
-- No directory traversal is possible — all files live flat in one folder
