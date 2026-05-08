@@ -1,6 +1,6 @@
 # Claude Notes MCP Server
 
-A lightweight MCP server that gives Claude read/write access to your notes and Apple Reminders — stored in a private GitHub repo and accessible from any Claude client (desktop, mobile, iPad).
+A lightweight MCP server that gives Claude read/write access to a set of text files stored on Render. Works across all Claude clients (desktop, mobile, iPad) since it's hosted in the cloud. Also has a reminders feature, that provides HTTP endpoints to sync to Apple devices via the Scriptable app (hence the .js files that do this).
 
 ---
 
@@ -71,11 +71,13 @@ After each sync a notification confirms how many reminders were active, complete
 - *"Create a file called jobs.md and start tracking my job applications"*
 - *"Add an entry to jobs.md: Shopify, Data Scientist, applied May 1"*
 - *"Read my jobs.md file"*
+- *"Update the status of the Shopify application to 'interview scheduled'"*
 
 **Reminders:**
 - *"What reminders do I have?"*
 - *"Add a reminder to call the dentist on Friday"*
 - *"Mark the 'buy groceries' reminder as done"*
+- *"Hey Claudsicle, add a reminder to get cheese."*
 
 ---
 
