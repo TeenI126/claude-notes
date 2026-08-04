@@ -6,7 +6,7 @@
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const SERVER_URL = "https://myclaude-n8nn.onrender.com"
+const SERVER_URL = "https://claude-notes-prod-1061098845460.us-central1.run.app"
 const NOTIFY     = true
 
 // Filter to specific lists (empty = all lists)
