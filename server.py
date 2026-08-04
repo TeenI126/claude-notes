@@ -1,7 +1,7 @@
 """
 Claude Notes MCP Server
 FastMCP with Streamable HTTP transport (MCP spec 2025-03-26).
-Notes are stored in a GitHub repo for persistence across Render deploys.
+Notes are stored in a GitHub repo for persistence across deploys.
 Includes a two-way Apple Reminders sync system (via Scriptable on iOS).
 OAuth 2.0 authorization server with PKCE (RFC 7636) for MCP clients.
 """
@@ -50,7 +50,27 @@ TransportSecurityMiddleware.__init__ = _init_no_dns_rebinding
 AUTH_TOKEN    = os.environ.get("AUTH_TOKEN", "")
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO   = os.environ.get("GITHUB_REPO", "")
-SERVER_URL    = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+
+# Cloud Run has no equivalent of Render's RENDER_EXTERNAL_URL — the service's
+# hostname isn't known until after the first deploy, and one service answers on
+# several of them (the base URL, a `preview---` tag URL, any custom domain). So
+# the OAuth metadata below derives the base URL per-request from the Host header
+# instead of a fixed value; PUBLIC_URL pins it explicitly if that's ever wrong.
+PUBLIC_URL    = (os.environ.get("PUBLIC_URL", "")).rstrip("/")
+FALLBACK_URL  = PUBLIC_URL or "http://localhost:8000"
+
+
+def _server_url(request: Request) -> str:
+    """Base URL that clients should use to reach this server."""
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    host = request.headers.get("host")
+    if not host:
+        return FALLBACK_URL
+    # Cloud Run terminates TLS at the edge and forwards over plain HTTP, so
+    # request.url.scheme alone would advertise http:// URLs to OAuth clients.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return f"{proto}://{host}"
 
 REMINDERS_PATH = "_system/reminders.json"
 
@@ -665,20 +685,22 @@ async def health(request: Request) -> Response:
 
 async def oauth_resource_metadata(request: Request) -> JSONResponse:
     """RFC 9728 — points MCP clients at this server's authorization server."""
+    base = _server_url(request)
     return JSONResponse({
-        "resource":                  SERVER_URL,
-        "authorization_servers":     [SERVER_URL],
+        "resource":                  base,
+        "authorization_servers":     [base],
         "bearer_methods_supported":  ["header", "query"],
     })
 
 
 async def oauth_server_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — describes this server's OAuth 2.0 capabilities."""
+    base = _server_url(request)
     return JSONResponse({
-        "issuer":                                SERVER_URL,
-        "authorization_endpoint":                f"{SERVER_URL}/oauth/authorize",
-        "token_endpoint":                        f"{SERVER_URL}/oauth/token",
-        "registration_endpoint":                 f"{SERVER_URL}/oauth/register",
+        "issuer":                                base,
+        "authorization_endpoint":                f"{base}/oauth/authorize",
+        "token_endpoint":                        f"{base}/oauth/token",
+        "registration_endpoint":                 f"{base}/oauth/register",
         "response_types_supported":              ["code"],
         "grant_types_supported":                 ["authorization_code"],
         "code_challenge_methods_supported":      ["S256"],

@@ -1,0 +1,26 @@
+# `gcloud run deploy --source .` uploads this directory as-is, so anything not
+# excluded here ends up in the build context (and the container image) —
+# .gitignore is NOT consulted once this file exists.
+
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# iOS Scriptable client — runs on the phone, not in the container.
+scriptable/
+
+# Never ship credentials, even by accident.
+.env
+.env.*
+*.env
+*-key.json
+*credentials*.json
+*service-account*.json
+*serviceaccount*.json
+*.pem
+*.p12
+*.pfx
