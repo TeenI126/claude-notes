@@ -447,9 +447,15 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # No token configured -> open access
+        # No token configured -> refuse everything. This used to fall through to
+        # open access, which is a bad failure mode for a service that is public
+        # at the network layer: a missing or misdelivered AUTH_TOKEN silently
+        # unauthenticates every note and reminder endpoint instead of failing
+        # loudly. _require_auth_token() below normally stops the process before
+        # this can be reached; this is the belt-and-braces half.
         if not AUTH_TOKEN:
-            await self.app(scope, receive, send)
+            response = Response("Server misconfigured: AUTH_TOKEN is not set", status_code=503)
+            await response(scope, receive, send)
             return
 
         request = Request(scope)
@@ -857,6 +863,24 @@ app = Starlette(
 )
 app.add_middleware(AuthMiddleware)
 
+
+def _require_auth_token() -> None:
+    """Refuse to start without AUTH_TOKEN.
+
+    Cloud Run only shifts traffic to a revision whose container came up, so
+    failing here means a deploy that lost the AUTH_TOKEN secret — a typo in the
+    secret name, a revoked accessor binding — leaves the previous good revision
+    serving instead of quietly standing up an unauthenticated one.
+    """
+    if not AUTH_TOKEN:
+        raise SystemExit(
+            "AUTH_TOKEN is not set — refusing to start.\n"
+            "On Cloud Run it comes from the claude-notes-auth-token secret; "
+            "locally, pass AUTH_TOKEN=dev."
+        )
+
+
 if __name__ == "__main__":
+    _require_auth_token()
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
