@@ -23,7 +23,7 @@ This is a single-file FastMCP server (`server.py`) deployed on Google Cloud Run.
 
 **OAuth flow** (RFC 6749 authorization code + PKCE, RFC 7636):
 - `/.well-known/oauth-authorization-server` — RFC 8414 server metadata; tells clients where all endpoints are
-- `/.well-known/oauth-protected-resource` — RFC 9728 resource metadata; points clients at this server as their authorization server
+- `/.well-known/oauth-protected-resource` — RFC 9728 resource metadata; points clients at this server as their authorization server. Also served with a path suffix (`/.well-known/oauth-protected-resource/mcp`), which is the form RFC 9728 specifies for a resource that lives at a path and the first URL a client configured with `<base>/mcp` probes; the suffixed response reports `resource` as `<base>/mcp`. `/.well-known/oauth-authorization-server` accepts a suffix too, for clients that probe it the same way.
 - `GET /oauth/authorize` — renders a login form asking for the server token; requires `response_type=code`, `code_challenge` (S256 only), `redirect_uri`
 - `POST /oauth/authorize` — validates the password against `AUTH_TOKEN`, stores an auth code (10 min TTL) in memory, redirects to `redirect_uri?code=…&state=…`
 - `POST /oauth/token` — validates the code + PKCE `code_verifier`, returns a stateless HMAC-signed access token (1 hr TTL); accepts both `application/json` and `application/x-www-form-urlencoded`

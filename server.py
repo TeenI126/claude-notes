@@ -742,10 +742,19 @@ async def health(request: Request) -> Response:
 
 
 async def oauth_resource_metadata(request: Request) -> JSONResponse:
-    """RFC 9728 — points MCP clients at this server's authorization server."""
-    base = _server_url(request)
+    """RFC 9728 — points MCP clients at this server's authorization server.
+
+    Served both bare and with a resource path suffix, i.e.
+    /.well-known/oauth-protected-resource/mcp. The suffixed form is what RFC
+    9728 actually specifies for a resource that lives at a path, and it is the
+    first URL a client configured with `<base>/mcp` requests; only the bare form
+    existed before, so that probe 404'd.
+    """
+    base     = _server_url(request)
+    suffix   = request.path_params.get("path", "").strip("/")
+    resource = f"{base}/{suffix}" if suffix else base
     return JSONResponse({
-        "resource":                  base,
+        "resource":                  resource,
         "authorization_servers":     [base],
         "bearer_methods_supported":  ["header", "query"],
     })
@@ -903,8 +912,10 @@ app = Starlette(
     lifespan=lifespan,
     routes=[
         Route("/health",                                  endpoint=health),
-        Route("/.well-known/oauth-protected-resource",   endpoint=oauth_resource_metadata),
-        Route("/.well-known/oauth-authorization-server", endpoint=oauth_server_metadata),
+        Route("/.well-known/oauth-protected-resource",           endpoint=oauth_resource_metadata),
+        Route("/.well-known/oauth-protected-resource/{path:path}", endpoint=oauth_resource_metadata),
+        Route("/.well-known/oauth-authorization-server",           endpoint=oauth_server_metadata),
+        Route("/.well-known/oauth-authorization-server/{path:path}", endpoint=oauth_server_metadata),
         Route("/oauth/authorize",                         endpoint=oauth_authorize,       methods=["GET", "POST"]),
         Route("/oauth/token",                             endpoint=oauth_token,            methods=["POST"]),
         Route("/oauth/register",                          endpoint=oauth_register,         methods=["POST"]),
