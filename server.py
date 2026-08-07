@@ -1,7 +1,7 @@
 """
 Claude Notes MCP Server
 FastMCP with Streamable HTTP transport (MCP spec 2025-03-26).
-Notes are stored in a GitHub repo for persistence across Render deploys.
+Notes are stored in a GitHub repo for persistence across deploys.
 Includes a two-way Apple Reminders sync system (via Scriptable on iOS).
 OAuth 2.0 authorization server with PKCE (RFC 7636) for MCP clients.
 """
@@ -17,6 +17,7 @@ import time
 import html as html_mod
 import asyncio
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from github import Github, GithubException
@@ -50,7 +51,48 @@ TransportSecurityMiddleware.__init__ = _init_no_dns_rebinding
 AUTH_TOKEN    = os.environ.get("AUTH_TOKEN", "")
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO   = os.environ.get("GITHUB_REPO", "")
-SERVER_URL    = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+
+# Cloud Run has no equivalent of Render's RENDER_EXTERNAL_URL — the service's
+# hostname isn't known until after the first deploy, and one service answers on
+# several of them (the base URL, a `preview---` tag URL, any custom domain). So
+# the OAuth metadata below derives the base URL per-request from the Host header
+# instead of a fixed value; PUBLIC_URL pins it explicitly if that's ever wrong.
+PUBLIC_URL    = (os.environ.get("PUBLIC_URL", "")).rstrip("/")
+FALLBACK_URL  = PUBLIC_URL or "http://localhost:8000"
+
+# Google Sign-In. When all three are set, the human half of the OAuth flow — the
+# form that asks for AUTH_TOKEN — is replaced by a Google login restricted to
+# ALLOWED_GOOGLE_EMAILS. Everything the MCP client sees is unchanged: this server
+# is still its authorization server, still issues its own PKCE-bound codes and
+# bearer tokens. Only the step where a human proves who they are moves to Google.
+#
+# Note what this does and does not buy: the interactive path stops involving a
+# shared secret, but AUTH_TOKEN remains a full-access bearer credential on the
+# `?token=` path because Scriptable on iOS cannot do an interactive login.
+GOOGLE_CLIENT_ID      = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET  = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+ALLOWED_GOOGLE_EMAILS = frozenset(
+    e.strip().lower()
+    for e in os.environ.get("ALLOWED_GOOGLE_EMAILS", "").split(",")
+    if e.strip()
+)
+
+
+def _google_signin_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_GOOGLE_EMAILS)
+
+
+def _server_url(request: Request) -> str:
+    """Base URL that clients should use to reach this server."""
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    host = request.headers.get("host")
+    if not host:
+        return FALLBACK_URL
+    # Cloud Run terminates TLS at the edge and forwards over plain HTTP, so
+    # request.url.scheme alone would advertise http:// URLs to OAuth clients.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return f"{proto}://{host}"
 
 REMINDERS_PATH = "_system/reminders.json"
 
@@ -59,38 +101,100 @@ REMINDERS_PATH = "_system/reminders.json"
 _ACCESS_TOKEN_TTL = 3600   # 1 hour
 _AUTH_CODE_TTL    = 600    # 10 minutes
 
-# In-memory stores — cleared on restart; clients re-auth automatically
-_auth_codes:         dict[str, dict] = {}
-_registered_clients: dict[str, dict] = {}
+# Best-effort replay guard for authorization codes, keyed by the code's jti.
+# Codes are stateless (see below), so single-use can't be enforced by deleting a
+# stored row the way it used to be. This catches a replay that happens to land on
+# the same instance; PKCE is what actually makes replay unexploitable, since an
+# intercepted code is worthless without the client's code_verifier.
+_used_auth_codes: dict[str, float] = {}
+
+# ── Signed-token helpers ──────────────────────────────────────────────────────
+
+def _sign(purpose: str, data: str) -> str:
+    """Domain-separated HMAC-SHA256 over `data`.
+
+    Access tokens and authorization codes are both signed with AUTH_TOKEN and
+    share an envelope, so without the purpose prefix an authorization code would
+    verify as a valid bearer token — it carries a signature and an unexpired
+    `exp`, which is everything the old access-token check looked at.
+    """
+    return hmac.new(AUTH_TOKEN.encode(), f"{purpose}:{data}".encode(), hashlib.sha256).hexdigest()
+
+
+def _encode_signed(purpose: str, payload: dict, ttl: int) -> str:
+    """Pack a payload plus expiry into `base64url(json).hexsig`."""
+    body = dict(payload, iat=int(time.time()), exp=int(time.time()) + ttl)
+    raw  = json.dumps(body, separators=(",", ":")).encode()
+    data = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return f"{data}.{_sign(purpose, data)}"
+
+
+def _decode_signed(purpose: str, token: str) -> dict | None:
+    """Return the payload iff the signature matches `purpose` and it's unexpired."""
+    if not AUTH_TOKEN:
+        return None
+    try:
+        data, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, _sign(purpose, data)):
+            return None
+        padding = (4 - len(data) % 4) % 4
+        payload = json.loads(base64.urlsafe_b64decode(data + "=" * padding))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        return None
+    return payload
 
 # ── OAuth token helpers ───────────────────────────────────────────────────────
 
 def _issue_access_token(client_id: str) -> str:
     """Return an HMAC-SHA256-signed access token. Stateless — survives restarts."""
-    payload = json.dumps({
-        "sub": client_id,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + _ACCESS_TOKEN_TTL,
-    }, separators=(",", ":"))
-    data = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
-    sig  = hmac.new(AUTH_TOKEN.encode(), data.encode(), hashlib.sha256).hexdigest()
-    return f"{data}.{sig}"
+    return _encode_signed("access", {"sub": client_id}, _ACCESS_TOKEN_TTL)
 
 
 def _verify_access_token(token: str) -> bool:
     """Return True if the token has a valid HMAC signature and is unexpired."""
-    if not AUTH_TOKEN:
-        return False
-    try:
-        data, sig = token.rsplit(".", 1)
-        expected  = hmac.new(AUTH_TOKEN.encode(), data.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return False
-        padding = (4 - len(data) % 4) % 4
-        payload = json.loads(base64.urlsafe_b64decode(data + "=" * padding))
-        return payload.get("exp", 0) >= int(time.time())
-    except Exception:
-        return False
+    return _decode_signed("access", token) is not None
+
+
+def _issue_auth_code(
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+) -> str:
+    """Return a signed authorization code carrying its own grant details.
+
+    These used to live in a process-level dict, which quietly breaks on Cloud
+    Run: /oauth/authorize and /oauth/token are separate requests, so with more
+    than one instance the exchange can land somewhere that never saw the code.
+    Signing the grant into the code itself removes the shared state entirely.
+    """
+    return _encode_signed("code", {
+        "cid": client_id,
+        "uri": redirect_uri,
+        "cc":  code_challenge,
+        "ccm": code_challenge_method,
+        "jti": secrets.token_urlsafe(8),
+    }, _AUTH_CODE_TTL)
+
+
+def _consume_auth_code(code: str) -> dict | None:
+    """Validate an authorization code and mark it used on this instance."""
+    payload = _decode_signed("code", code)
+    if payload is None:
+        return None
+
+    now = time.time()
+    for jti, expiry in list(_used_auth_codes.items()):
+        if expiry < now:
+            del _used_auth_codes[jti]
+
+    jti = payload.get("jti", "")
+    if jti in _used_auth_codes:
+        return None
+    _used_auth_codes[jti] = payload.get("exp", now)
+    return payload
 
 # ── FastMCP ───────────────────────────────────────────────────────────────────
 
@@ -427,9 +531,15 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # No token configured -> open access
+        # No token configured -> refuse everything. This used to fall through to
+        # open access, which is a bad failure mode for a service that is public
+        # at the network layer: a missing or misdelivered AUTH_TOKEN silently
+        # unauthenticates every note and reminder endpoint instead of failing
+        # loudly. _require_auth_token() below normally stops the process before
+        # this can be reached; this is the belt-and-braces half.
         if not AUTH_TOKEN:
-            await self.app(scope, receive, send)
+            response = Response("Server misconfigured: AUTH_TOKEN is not set", status_code=503)
+            await response(scope, receive, send)
             return
 
         request = Request(scope)
@@ -518,8 +628,76 @@ def _render_auth_form(
     )
 
 
+_GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_STATE_TTL = 600    # 10 minutes to complete a Google login
+
+
+def _google_redirect_uri(request: Request) -> str:
+    """Must match a redirect URI registered on the Google OAuth client exactly."""
+    return f"{_server_url(request)}/oauth/google/callback"
+
+
+def _google_exchange_and_verify(code: str, redirect_uri: str) -> str | None:
+    """Trade a Google auth code for an ID token; return the verified email.
+
+    Blocking (urllib + RSA verification), so callers run it off the event loop.
+    """
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+
+    body = urllib.parse.urlencode({
+        "code":          code,
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri":  redirect_uri,
+        "grant_type":    "authorization_code",
+    }).encode()
+    req = urllib.request.Request(
+        _GOOGLE_TOKEN_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+
+    raw = payload.get("id_token", "")
+    if not raw:
+        return None
+
+    # Verifies the RSA signature against Google's JWKS plus iss/aud/exp. Doing
+    # this rather than trusting the TLS channel keeps the check honest even if
+    # the token ever arrives by another route.
+    claims = google_id_token.verify_oauth2_token(
+        raw, google_requests.Request(), GOOGLE_CLIENT_ID,
+    )
+    if not claims.get("email_verified"):
+        return None
+    return (claims.get("email") or "").strip().lower()
+
+
+def _notice_page(title: str, detail: str, status: int) -> HTMLResponse:
+    return HTMLResponse(
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{html_mod.escape(title)} — Claude Notes</title></head>"
+        f"<body style=\"font-family:system-ui,-apple-system,sans-serif;margin:0;"
+        f"padding:40px 20px;background:#f5f5f5\">"
+        f"<div style=\"background:#fff;border-radius:12px;padding:32px;max-width:420px;"
+        f"margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,.1)\">"
+        f"<h1 style='font-size:18px;margin:0 0 12px'>{html_mod.escape(title)}</h1>"
+        f"<p style='color:#555;margin:0;line-height:1.5'>{html_mod.escape(detail)}</p>"
+        f"</div></body></html>",
+        status_code=status,
+    )
+
+
 async def oauth_authorize(request: Request) -> Response:
-    """GET: show login form.  POST: validate token, issue auth code, redirect."""
+    """GET: start the login.  POST: validate the token form, issue an auth code.
+
+    With Google Sign-In configured the GET hands off to Google and the POST form
+    is disabled — leaving it live would keep AUTH_TOKEN working as an interactive
+    password and quietly bypass the allowlist the Google path enforces.
+    """
     if request.method == "GET":
         params                = request.query_params
         response_type         = params.get("response_type", "")
@@ -538,6 +716,27 @@ async def oauth_authorize(request: Request) -> Response:
         if code_challenge_method != "S256":
             return Response("only S256 code_challenge_method is supported", status_code=400)
 
+        if _google_signin_enabled():
+            # The client's grant details ride through Google in the signed state
+            # parameter and come back on the callback, so no server-side pending
+            # store is needed — same reason auth codes are signed.
+            pending = _encode_signed("gstate", {
+                "cid": client_id,
+                "uri": redirect_uri,
+                "st":  state,
+                "cc":  code_challenge,
+                "ccm": code_challenge_method,
+            }, _GOOGLE_STATE_TTL)
+            query = urllib.parse.urlencode({
+                "client_id":     GOOGLE_CLIENT_ID,
+                "redirect_uri":  _google_redirect_uri(request),
+                "response_type": "code",
+                "scope":         "openid email",
+                "state":         pending,
+                "prompt":        "select_account",
+            })
+            return Response(status_code=302, headers={"Location": f"{_GOOGLE_AUTH_URL}?{query}"})
+
         return HTMLResponse(_render_auth_form(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -545,6 +744,14 @@ async def oauth_authorize(request: Request) -> Response:
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
         ))
+
+    if _google_signin_enabled():
+        return _notice_page(
+            "Sign in with Google",
+            "This server authenticates through Google. Start the connector's "
+            "sign-in again rather than submitting a token here.",
+            400,
+        )
 
     # POST — process the login form
     form                  = await request.form()
@@ -578,17 +785,68 @@ async def oauth_authorize(request: Request) -> Response:
     if AUTH_TOKEN and not hmac.compare_digest(password, AUTH_TOKEN):
         return _form_error("Invalid token — please try again.")
 
-    code = secrets.token_urlsafe(32)
-    _auth_codes[code] = {
-        "client_id":             client_id,
-        "redirect_uri":          redirect_uri,
-        "code_challenge":        code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "expires_at":            time.time() + _AUTH_CODE_TTL,
-    }
+    code = _issue_auth_code(client_id, redirect_uri, code_challenge, code_challenge_method)
 
     sep      = "&" if "?" in redirect_uri else "?"
     location = redirect_uri + sep + urllib.parse.urlencode({"code": code, "state": state})
+    return Response(status_code=302, headers={"Location": location})
+
+
+async def oauth_google_callback(request: Request) -> Response:
+    """Where Google returns the human, mid-way through the MCP client's flow."""
+    params = request.query_params
+
+    if params.get("error"):
+        return _notice_page("Sign-in cancelled", f"Google reported: {params['error']}", 400)
+
+    pending = _decode_signed("gstate", params.get("state", ""))
+    if pending is None:
+        return _notice_page(
+            "Sign-in expired",
+            "That login link is no longer valid. Start the connector's sign-in again.",
+            400,
+        )
+
+    code = params.get("code", "")
+    if not code:
+        return _notice_page("Sign-in failed", "Google did not return an authorization code.", 400)
+
+    try:
+        email = await asyncio.to_thread(
+            _google_exchange_and_verify, code, _google_redirect_uri(request),
+        )
+    except Exception:
+        return _notice_page(
+            "Sign-in failed",
+            "Could not verify the Google sign-in. Please try again.",
+            502,
+        )
+
+    if not email:
+        return _notice_page(
+            "Sign-in failed",
+            "Google did not return a verified email address for that account.",
+            403,
+        )
+    if email not in ALLOWED_GOOGLE_EMAILS:
+        return _notice_page(
+            "Not authorized",
+            f"{email} is not permitted to access this server.",
+            403,
+        )
+
+    # Google vouched for an allowed human; hand the MCP client the code it has
+    # been waiting for. Its PKCE challenge rode through in the signed state, so
+    # the code stays bound to the client that started the flow.
+    our_code = _issue_auth_code(
+        pending.get("cid", ""), pending.get("uri", ""),
+        pending.get("cc", ""),  pending.get("ccm", "S256"),
+    )
+    target   = pending.get("uri", "")
+    sep      = "&" if "?" in target else "?"
+    location = target + sep + urllib.parse.urlencode(
+        {"code": our_code, "state": pending.get("st", "")}
+    )
     return Response(status_code=302, headers={"Location": location})
 
 
@@ -614,21 +872,19 @@ async def oauth_token(request: Request) -> JSONResponse:
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    code_data = _auth_codes.pop(code, None)
+    code_data = _consume_auth_code(code)
     if not code_data:
         return JSONResponse({"error": "invalid_grant", "error_description": "unknown or expired code"}, status_code=400)
-    if code_data["expires_at"] < time.time():
-        return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
-    if code_data["redirect_uri"] != redirect_uri:
+    if code_data["uri"] != redirect_uri:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
     # Verify PKCE S256: challenge == base64url(sha256(verifier))
     digest    = hashlib.sha256(code_verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
-    if not hmac.compare_digest(challenge, code_data["code_challenge"]):
+    if not hmac.compare_digest(challenge, code_data["cc"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    access_token = _issue_access_token(code_data["client_id"])
+    access_token = _issue_access_token(code_data["cid"])
     return JSONResponse({
         "access_token": access_token,
         "token_type":   "bearer",
@@ -643,12 +899,11 @@ async def oauth_register(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
+    # Nothing is stored: this is a public-client model with no client secret, and
+    # the issued client_id was only ever echoed back — no code path validated an
+    # incoming client_id against the registry, so keeping one just meant a second
+    # per-instance dict that a scaled-out deploy would disagree about.
     client_id = f"client-{secrets.token_urlsafe(12)}"
-    _registered_clients[client_id] = {
-        "redirect_uris": body.get("redirect_uris", []),
-        "client_name":   body.get("client_name", ""),
-        "registered_at": time.time(),
-    }
     return JSONResponse({
         "client_id":                     client_id,
         "redirect_uris":                 body.get("redirect_uris", []),
@@ -664,21 +919,32 @@ async def health(request: Request) -> Response:
 
 
 async def oauth_resource_metadata(request: Request) -> JSONResponse:
-    """RFC 9728 — points MCP clients at this server's authorization server."""
+    """RFC 9728 — points MCP clients at this server's authorization server.
+
+    Served both bare and with a resource path suffix, i.e.
+    /.well-known/oauth-protected-resource/mcp. The suffixed form is what RFC
+    9728 actually specifies for a resource that lives at a path, and it is the
+    first URL a client configured with `<base>/mcp` requests; only the bare form
+    existed before, so that probe 404'd.
+    """
+    base     = _server_url(request)
+    suffix   = request.path_params.get("path", "").strip("/")
+    resource = f"{base}/{suffix}" if suffix else base
     return JSONResponse({
-        "resource":                  SERVER_URL,
-        "authorization_servers":     [SERVER_URL],
+        "resource":                  resource,
+        "authorization_servers":     [base],
         "bearer_methods_supported":  ["header", "query"],
     })
 
 
 async def oauth_server_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — describes this server's OAuth 2.0 capabilities."""
+    base = _server_url(request)
     return JSONResponse({
-        "issuer":                                SERVER_URL,
-        "authorization_endpoint":                f"{SERVER_URL}/oauth/authorize",
-        "token_endpoint":                        f"{SERVER_URL}/oauth/token",
-        "registration_endpoint":                 f"{SERVER_URL}/oauth/register",
+        "issuer":                                base,
+        "authorization_endpoint":                f"{base}/oauth/authorize",
+        "token_endpoint":                        f"{base}/oauth/token",
+        "registration_endpoint":                 f"{base}/oauth/register",
         "response_types_supported":              ["code"],
         "grant_types_supported":                 ["authorization_code"],
         "code_challenge_methods_supported":      ["S256"],
@@ -823,9 +1089,12 @@ app = Starlette(
     lifespan=lifespan,
     routes=[
         Route("/health",                                  endpoint=health),
-        Route("/.well-known/oauth-protected-resource",   endpoint=oauth_resource_metadata),
-        Route("/.well-known/oauth-authorization-server", endpoint=oauth_server_metadata),
+        Route("/.well-known/oauth-protected-resource",           endpoint=oauth_resource_metadata),
+        Route("/.well-known/oauth-protected-resource/{path:path}", endpoint=oauth_resource_metadata),
+        Route("/.well-known/oauth-authorization-server",           endpoint=oauth_server_metadata),
+        Route("/.well-known/oauth-authorization-server/{path:path}", endpoint=oauth_server_metadata),
         Route("/oauth/authorize",                         endpoint=oauth_authorize,       methods=["GET", "POST"]),
+        Route("/oauth/google/callback",                    endpoint=oauth_google_callback,  methods=["GET"]),
         Route("/oauth/token",                             endpoint=oauth_token,            methods=["POST"]),
         Route("/oauth/register",                          endpoint=oauth_register,         methods=["POST"]),
         Route("/write",                                   endpoint=rest_write,             methods=["POST"]),
@@ -835,6 +1104,39 @@ app = Starlette(
 )
 app.add_middleware(AuthMiddleware)
 
+
+def _require_auth_token() -> None:
+    """Refuse to start without AUTH_TOKEN.
+
+    Cloud Run only shifts traffic to a revision whose container came up, so
+    failing here means a deploy that lost the AUTH_TOKEN secret — a typo in the
+    secret name, a revoked accessor binding — leaves the previous good revision
+    serving instead of quietly standing up an unauthenticated one.
+    """
+    if not AUTH_TOKEN:
+        raise SystemExit(
+            "AUTH_TOKEN is not set — refusing to start.\n"
+            "On Cloud Run it comes from the claude-notes-auth-token secret; "
+            "locally, pass AUTH_TOKEN=dev."
+        )
+
+    # A Google client with no allowlist would let *any* Google account through,
+    # which is worse than the password form it replaces. Half-configured is the
+    # dangerous state, so refuse it rather than silently falling back.
+    if (GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET) and not ALLOWED_GOOGLE_EMAILS:
+        raise SystemExit(
+            "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are set but "
+            "ALLOWED_GOOGLE_EMAILS is empty — refusing to start, since that "
+            "would admit any Google account. Set ALLOWED_GOOGLE_EMAILS to a "
+            "comma-separated list, or unset the Google client config."
+        )
+    if (GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET) and not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise SystemExit(
+            "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must both be set, or neither."
+        )
+
+
 if __name__ == "__main__":
+    _require_auth_token()
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

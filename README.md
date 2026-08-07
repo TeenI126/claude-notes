@@ -1,6 +1,6 @@
 # Claude Notes MCP Server
 
-A lightweight MCP server that gives Claude read/write access to a set of text files stored on Render. Works across all Claude clients (desktop, mobile, iPad) since it's hosted in the cloud. Also has a reminders feature, that provides HTTP endpoints to sync to Apple devices via the Scriptable app (hence the .js files that do this).
+A lightweight MCP server that gives Claude read/write access to a set of text files, hosted on Google Cloud Run. Works across all Claude clients (desktop, mobile, iPad) since it's hosted in the cloud. Also has a reminders feature, that provides HTTP endpoints to sync to Apple devices via the Scriptable app (hence the .js files that do this).
 
 ---
 
@@ -83,8 +83,8 @@ After each sync a notification confirms how many reminders were active, complete
 
 ## Notes
 
-- Notes and reminders are stored in a private GitHub repo — data persists across Render deploys
-- Free tier may have a ~30 s cold start if the server hasn't been used recently
+- Notes and reminders are stored in a private GitHub repo — data persists across deploys, and Cloud Run's stateless containers keep no local state of their own
+- The service scales to zero, so expect a cold start of a few seconds if it hasn't been used recently
 - Filenames starting with `.` or `_system` are blocked; everything else is allowed
 - All files live flat in one folder — no directory traversal is possible
 - `_system/reminders.json` is managed automatically; do not edit it manually
