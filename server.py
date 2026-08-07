@@ -17,6 +17,7 @@ import time
 import html as html_mod
 import asyncio
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from github import Github, GithubException
@@ -58,6 +59,27 @@ GITHUB_REPO   = os.environ.get("GITHUB_REPO", "")
 # instead of a fixed value; PUBLIC_URL pins it explicitly if that's ever wrong.
 PUBLIC_URL    = (os.environ.get("PUBLIC_URL", "")).rstrip("/")
 FALLBACK_URL  = PUBLIC_URL or "http://localhost:8000"
+
+# Google Sign-In. When all three are set, the human half of the OAuth flow — the
+# form that asks for AUTH_TOKEN — is replaced by a Google login restricted to
+# ALLOWED_GOOGLE_EMAILS. Everything the MCP client sees is unchanged: this server
+# is still its authorization server, still issues its own PKCE-bound codes and
+# bearer tokens. Only the step where a human proves who they are moves to Google.
+#
+# Note what this does and does not buy: the interactive path stops involving a
+# shared secret, but AUTH_TOKEN remains a full-access bearer credential on the
+# `?token=` path because Scriptable on iOS cannot do an interactive login.
+GOOGLE_CLIENT_ID      = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET  = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+ALLOWED_GOOGLE_EMAILS = frozenset(
+    e.strip().lower()
+    for e in os.environ.get("ALLOWED_GOOGLE_EMAILS", "").split(",")
+    if e.strip()
+)
+
+
+def _google_signin_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_GOOGLE_EMAILS)
 
 
 def _server_url(request: Request) -> str:
@@ -606,8 +628,76 @@ def _render_auth_form(
     )
 
 
+_GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_STATE_TTL = 600    # 10 minutes to complete a Google login
+
+
+def _google_redirect_uri(request: Request) -> str:
+    """Must match a redirect URI registered on the Google OAuth client exactly."""
+    return f"{_server_url(request)}/oauth/google/callback"
+
+
+def _google_exchange_and_verify(code: str, redirect_uri: str) -> str | None:
+    """Trade a Google auth code for an ID token; return the verified email.
+
+    Blocking (urllib + RSA verification), so callers run it off the event loop.
+    """
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+
+    body = urllib.parse.urlencode({
+        "code":          code,
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri":  redirect_uri,
+        "grant_type":    "authorization_code",
+    }).encode()
+    req = urllib.request.Request(
+        _GOOGLE_TOKEN_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+
+    raw = payload.get("id_token", "")
+    if not raw:
+        return None
+
+    # Verifies the RSA signature against Google's JWKS plus iss/aud/exp. Doing
+    # this rather than trusting the TLS channel keeps the check honest even if
+    # the token ever arrives by another route.
+    claims = google_id_token.verify_oauth2_token(
+        raw, google_requests.Request(), GOOGLE_CLIENT_ID,
+    )
+    if not claims.get("email_verified"):
+        return None
+    return (claims.get("email") or "").strip().lower()
+
+
+def _notice_page(title: str, detail: str, status: int) -> HTMLResponse:
+    return HTMLResponse(
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{html_mod.escape(title)} — Claude Notes</title></head>"
+        f"<body style=\"font-family:system-ui,-apple-system,sans-serif;margin:0;"
+        f"padding:40px 20px;background:#f5f5f5\">"
+        f"<div style=\"background:#fff;border-radius:12px;padding:32px;max-width:420px;"
+        f"margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,.1)\">"
+        f"<h1 style='font-size:18px;margin:0 0 12px'>{html_mod.escape(title)}</h1>"
+        f"<p style='color:#555;margin:0;line-height:1.5'>{html_mod.escape(detail)}</p>"
+        f"</div></body></html>",
+        status_code=status,
+    )
+
+
 async def oauth_authorize(request: Request) -> Response:
-    """GET: show login form.  POST: validate token, issue auth code, redirect."""
+    """GET: start the login.  POST: validate the token form, issue an auth code.
+
+    With Google Sign-In configured the GET hands off to Google and the POST form
+    is disabled — leaving it live would keep AUTH_TOKEN working as an interactive
+    password and quietly bypass the allowlist the Google path enforces.
+    """
     if request.method == "GET":
         params                = request.query_params
         response_type         = params.get("response_type", "")
@@ -626,6 +716,27 @@ async def oauth_authorize(request: Request) -> Response:
         if code_challenge_method != "S256":
             return Response("only S256 code_challenge_method is supported", status_code=400)
 
+        if _google_signin_enabled():
+            # The client's grant details ride through Google in the signed state
+            # parameter and come back on the callback, so no server-side pending
+            # store is needed — same reason auth codes are signed.
+            pending = _encode_signed("gstate", {
+                "cid": client_id,
+                "uri": redirect_uri,
+                "st":  state,
+                "cc":  code_challenge,
+                "ccm": code_challenge_method,
+            }, _GOOGLE_STATE_TTL)
+            query = urllib.parse.urlencode({
+                "client_id":     GOOGLE_CLIENT_ID,
+                "redirect_uri":  _google_redirect_uri(request),
+                "response_type": "code",
+                "scope":         "openid email",
+                "state":         pending,
+                "prompt":        "select_account",
+            })
+            return Response(status_code=302, headers={"Location": f"{_GOOGLE_AUTH_URL}?{query}"})
+
         return HTMLResponse(_render_auth_form(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -633,6 +744,14 @@ async def oauth_authorize(request: Request) -> Response:
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
         ))
+
+    if _google_signin_enabled():
+        return _notice_page(
+            "Sign in with Google",
+            "This server authenticates through Google. Start the connector's "
+            "sign-in again rather than submitting a token here.",
+            400,
+        )
 
     # POST — process the login form
     form                  = await request.form()
@@ -670,6 +789,64 @@ async def oauth_authorize(request: Request) -> Response:
 
     sep      = "&" if "?" in redirect_uri else "?"
     location = redirect_uri + sep + urllib.parse.urlencode({"code": code, "state": state})
+    return Response(status_code=302, headers={"Location": location})
+
+
+async def oauth_google_callback(request: Request) -> Response:
+    """Where Google returns the human, mid-way through the MCP client's flow."""
+    params = request.query_params
+
+    if params.get("error"):
+        return _notice_page("Sign-in cancelled", f"Google reported: {params['error']}", 400)
+
+    pending = _decode_signed("gstate", params.get("state", ""))
+    if pending is None:
+        return _notice_page(
+            "Sign-in expired",
+            "That login link is no longer valid. Start the connector's sign-in again.",
+            400,
+        )
+
+    code = params.get("code", "")
+    if not code:
+        return _notice_page("Sign-in failed", "Google did not return an authorization code.", 400)
+
+    try:
+        email = await asyncio.to_thread(
+            _google_exchange_and_verify, code, _google_redirect_uri(request),
+        )
+    except Exception:
+        return _notice_page(
+            "Sign-in failed",
+            "Could not verify the Google sign-in. Please try again.",
+            502,
+        )
+
+    if not email:
+        return _notice_page(
+            "Sign-in failed",
+            "Google did not return a verified email address for that account.",
+            403,
+        )
+    if email not in ALLOWED_GOOGLE_EMAILS:
+        return _notice_page(
+            "Not authorized",
+            f"{email} is not permitted to access this server.",
+            403,
+        )
+
+    # Google vouched for an allowed human; hand the MCP client the code it has
+    # been waiting for. Its PKCE challenge rode through in the signed state, so
+    # the code stays bound to the client that started the flow.
+    our_code = _issue_auth_code(
+        pending.get("cid", ""), pending.get("uri", ""),
+        pending.get("cc", ""),  pending.get("ccm", "S256"),
+    )
+    target   = pending.get("uri", "")
+    sep      = "&" if "?" in target else "?"
+    location = target + sep + urllib.parse.urlencode(
+        {"code": our_code, "state": pending.get("st", "")}
+    )
     return Response(status_code=302, headers={"Location": location})
 
 
@@ -917,6 +1094,7 @@ app = Starlette(
         Route("/.well-known/oauth-authorization-server",           endpoint=oauth_server_metadata),
         Route("/.well-known/oauth-authorization-server/{path:path}", endpoint=oauth_server_metadata),
         Route("/oauth/authorize",                         endpoint=oauth_authorize,       methods=["GET", "POST"]),
+        Route("/oauth/google/callback",                    endpoint=oauth_google_callback,  methods=["GET"]),
         Route("/oauth/token",                             endpoint=oauth_token,            methods=["POST"]),
         Route("/oauth/register",                          endpoint=oauth_register,         methods=["POST"]),
         Route("/write",                                   endpoint=rest_write,             methods=["POST"]),
@@ -940,6 +1118,21 @@ def _require_auth_token() -> None:
             "AUTH_TOKEN is not set — refusing to start.\n"
             "On Cloud Run it comes from the claude-notes-auth-token secret; "
             "locally, pass AUTH_TOKEN=dev."
+        )
+
+    # A Google client with no allowlist would let *any* Google account through,
+    # which is worse than the password form it replaces. Half-configured is the
+    # dangerous state, so refuse it rather than silently falling back.
+    if (GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET) and not ALLOWED_GOOGLE_EMAILS:
+        raise SystemExit(
+            "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are set but "
+            "ALLOWED_GOOGLE_EMAILS is empty — refusing to start, since that "
+            "would admit any Google account. Set ALLOWED_GOOGLE_EMAILS to a "
+            "comma-separated list, or unset the Google client config."
+        )
+    if (GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET) and not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise SystemExit(
+            "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must both be set, or neither."
         )
 
 

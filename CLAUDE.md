@@ -24,7 +24,8 @@ This is a single-file FastMCP server (`server.py`) deployed on Google Cloud Run.
 **OAuth flow** (RFC 6749 authorization code + PKCE, RFC 7636):
 - `/.well-known/oauth-authorization-server` — RFC 8414 server metadata; tells clients where all endpoints are
 - `/.well-known/oauth-protected-resource` — RFC 9728 resource metadata; points clients at this server as their authorization server. Also served with a path suffix (`/.well-known/oauth-protected-resource/mcp`), which is the form RFC 9728 specifies for a resource that lives at a path and the first URL a client configured with `<base>/mcp` probes; the suffixed response reports `resource` as `<base>/mcp`. `/.well-known/oauth-authorization-server` accepts a suffix too, for clients that probe it the same way.
-- `GET /oauth/authorize` — renders a login form asking for the server token; requires `response_type=code`, `code_challenge` (S256 only), `redirect_uri`
+- `GET /oauth/authorize` — starts the login; requires `response_type=code`, `code_challenge` (S256 only), `redirect_uri`. Renders a form asking for the server token, or redirects to Google when Google Sign-In is configured
+- `GET /oauth/google/callback` — where Google returns the user. Verifies the ID token (RSA signature against Google's JWKS, plus `iss`/`aud`/`exp`) via `google-auth`, checks `email_verified` and `ALLOWED_GOOGLE_EMAILS`, then issues this server's own auth code. The MCP client's grant details ride through Google in the signed `state` parameter, so no pending-login store is needed
 - `POST /oauth/authorize` — validates the password against `AUTH_TOKEN`, stores an auth code (10 min TTL) in memory, redirects to `redirect_uri?code=…&state=…`
 - `POST /oauth/token` — validates the code + PKCE `code_verifier`, returns a stateless HMAC-signed access token (1 hr TTL); accepts both `application/json` and `application/x-www-form-urlencoded`
 - `POST /oauth/register` — RFC 7591 dynamic client registration; issues a random `client_id` with no client secret (public client model)
@@ -55,6 +56,12 @@ The reminders JSON file is the single source of truth; concurrent writes are han
 | `GITHUB_REPO` | `owner/repo` of the private data repository |
 | `PUBLIC_URL` | Optional. Pins the base URL in the OAuth metadata responses. Leave unset on Cloud Run — the metadata endpoints derive it per-request from the `Host` header, so the base URL, the `preview---` tag URL, and any custom domain each advertise themselves correctly. |
 | `PORT` | HTTP port. Cloud Run injects `8080`; defaults to 8000 locally. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Optional. A Google OAuth **Web application** client. Set both or neither. When set with an allowlist, the token form is replaced by a Google login and the form POST is disabled. |
+| `ALLOWED_GOOGLE_EMAILS` | Comma-separated allowlist of Google accounts. Required whenever the Google client vars are set — the server refuses to start otherwise, since an empty allowlist would admit any Google account. |
+
+Google Sign-In changes only the *interactive* half of the flow. `AUTH_TOKEN` remains a full-access bearer credential on the `?token=` path, because Scriptable on iOS can't complete an interactive login — so this narrows where the shared secret has to live, it doesn't retire the secret.
+
+The Google redirect URI is derived per-request (`<base>/oauth/google/callback`) and must be registered on the Google client *exactly*. The service answers on two hostnames, so register both, or set `PUBLIC_URL` to pin one.
 
 Cloud Run has no equivalent of Render's `RENDER_EXTERNAL_URL` (the hostname isn't known until the first deploy, and one service answers on several), which is why `_server_url()` reads the `Host` and `X-Forwarded-Proto` headers instead of a fixed env var.
 
