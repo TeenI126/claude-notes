@@ -79,38 +79,100 @@ REMINDERS_PATH = "_system/reminders.json"
 _ACCESS_TOKEN_TTL = 3600   # 1 hour
 _AUTH_CODE_TTL    = 600    # 10 minutes
 
-# In-memory stores — cleared on restart; clients re-auth automatically
-_auth_codes:         dict[str, dict] = {}
-_registered_clients: dict[str, dict] = {}
+# Best-effort replay guard for authorization codes, keyed by the code's jti.
+# Codes are stateless (see below), so single-use can't be enforced by deleting a
+# stored row the way it used to be. This catches a replay that happens to land on
+# the same instance; PKCE is what actually makes replay unexploitable, since an
+# intercepted code is worthless without the client's code_verifier.
+_used_auth_codes: dict[str, float] = {}
+
+# ── Signed-token helpers ──────────────────────────────────────────────────────
+
+def _sign(purpose: str, data: str) -> str:
+    """Domain-separated HMAC-SHA256 over `data`.
+
+    Access tokens and authorization codes are both signed with AUTH_TOKEN and
+    share an envelope, so without the purpose prefix an authorization code would
+    verify as a valid bearer token — it carries a signature and an unexpired
+    `exp`, which is everything the old access-token check looked at.
+    """
+    return hmac.new(AUTH_TOKEN.encode(), f"{purpose}:{data}".encode(), hashlib.sha256).hexdigest()
+
+
+def _encode_signed(purpose: str, payload: dict, ttl: int) -> str:
+    """Pack a payload plus expiry into `base64url(json).hexsig`."""
+    body = dict(payload, iat=int(time.time()), exp=int(time.time()) + ttl)
+    raw  = json.dumps(body, separators=(",", ":")).encode()
+    data = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return f"{data}.{_sign(purpose, data)}"
+
+
+def _decode_signed(purpose: str, token: str) -> dict | None:
+    """Return the payload iff the signature matches `purpose` and it's unexpired."""
+    if not AUTH_TOKEN:
+        return None
+    try:
+        data, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, _sign(purpose, data)):
+            return None
+        padding = (4 - len(data) % 4) % 4
+        payload = json.loads(base64.urlsafe_b64decode(data + "=" * padding))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        return None
+    return payload
 
 # ── OAuth token helpers ───────────────────────────────────────────────────────
 
 def _issue_access_token(client_id: str) -> str:
     """Return an HMAC-SHA256-signed access token. Stateless — survives restarts."""
-    payload = json.dumps({
-        "sub": client_id,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + _ACCESS_TOKEN_TTL,
-    }, separators=(",", ":"))
-    data = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
-    sig  = hmac.new(AUTH_TOKEN.encode(), data.encode(), hashlib.sha256).hexdigest()
-    return f"{data}.{sig}"
+    return _encode_signed("access", {"sub": client_id}, _ACCESS_TOKEN_TTL)
 
 
 def _verify_access_token(token: str) -> bool:
     """Return True if the token has a valid HMAC signature and is unexpired."""
-    if not AUTH_TOKEN:
-        return False
-    try:
-        data, sig = token.rsplit(".", 1)
-        expected  = hmac.new(AUTH_TOKEN.encode(), data.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return False
-        padding = (4 - len(data) % 4) % 4
-        payload = json.loads(base64.urlsafe_b64decode(data + "=" * padding))
-        return payload.get("exp", 0) >= int(time.time())
-    except Exception:
-        return False
+    return _decode_signed("access", token) is not None
+
+
+def _issue_auth_code(
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+) -> str:
+    """Return a signed authorization code carrying its own grant details.
+
+    These used to live in a process-level dict, which quietly breaks on Cloud
+    Run: /oauth/authorize and /oauth/token are separate requests, so with more
+    than one instance the exchange can land somewhere that never saw the code.
+    Signing the grant into the code itself removes the shared state entirely.
+    """
+    return _encode_signed("code", {
+        "cid": client_id,
+        "uri": redirect_uri,
+        "cc":  code_challenge,
+        "ccm": code_challenge_method,
+        "jti": secrets.token_urlsafe(8),
+    }, _AUTH_CODE_TTL)
+
+
+def _consume_auth_code(code: str) -> dict | None:
+    """Validate an authorization code and mark it used on this instance."""
+    payload = _decode_signed("code", code)
+    if payload is None:
+        return None
+
+    now = time.time()
+    for jti, expiry in list(_used_auth_codes.items()):
+        if expiry < now:
+            del _used_auth_codes[jti]
+
+    jti = payload.get("jti", "")
+    if jti in _used_auth_codes:
+        return None
+    _used_auth_codes[jti] = payload.get("exp", now)
+    return payload
 
 # ── FastMCP ───────────────────────────────────────────────────────────────────
 
@@ -604,14 +666,7 @@ async def oauth_authorize(request: Request) -> Response:
     if AUTH_TOKEN and not hmac.compare_digest(password, AUTH_TOKEN):
         return _form_error("Invalid token — please try again.")
 
-    code = secrets.token_urlsafe(32)
-    _auth_codes[code] = {
-        "client_id":             client_id,
-        "redirect_uri":          redirect_uri,
-        "code_challenge":        code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "expires_at":            time.time() + _AUTH_CODE_TTL,
-    }
+    code = _issue_auth_code(client_id, redirect_uri, code_challenge, code_challenge_method)
 
     sep      = "&" if "?" in redirect_uri else "?"
     location = redirect_uri + sep + urllib.parse.urlencode({"code": code, "state": state})
@@ -640,21 +695,19 @@ async def oauth_token(request: Request) -> JSONResponse:
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    code_data = _auth_codes.pop(code, None)
+    code_data = _consume_auth_code(code)
     if not code_data:
         return JSONResponse({"error": "invalid_grant", "error_description": "unknown or expired code"}, status_code=400)
-    if code_data["expires_at"] < time.time():
-        return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
-    if code_data["redirect_uri"] != redirect_uri:
+    if code_data["uri"] != redirect_uri:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
     # Verify PKCE S256: challenge == base64url(sha256(verifier))
     digest    = hashlib.sha256(code_verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
-    if not hmac.compare_digest(challenge, code_data["code_challenge"]):
+    if not hmac.compare_digest(challenge, code_data["cc"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    access_token = _issue_access_token(code_data["client_id"])
+    access_token = _issue_access_token(code_data["cid"])
     return JSONResponse({
         "access_token": access_token,
         "token_type":   "bearer",
@@ -669,12 +722,11 @@ async def oauth_register(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
+    # Nothing is stored: this is a public-client model with no client secret, and
+    # the issued client_id was only ever echoed back — no code path validated an
+    # incoming client_id against the registry, so keeping one just meant a second
+    # per-instance dict that a scaled-out deploy would disagree about.
     client_id = f"client-{secrets.token_urlsafe(12)}"
-    _registered_clients[client_id] = {
-        "redirect_uris": body.get("redirect_uris", []),
-        "client_name":   body.get("client_name", ""),
-        "registered_at": time.time(),
-    }
     return JSONResponse({
         "client_id":                     client_id,
         "redirect_uris":                 body.get("redirect_uris", []),

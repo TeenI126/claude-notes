@@ -29,7 +29,13 @@ This is a single-file FastMCP server (`server.py`) deployed on Google Cloud Run.
 - `POST /oauth/token` — validates the code + PKCE `code_verifier`, returns a stateless HMAC-signed access token (1 hr TTL); accepts both `application/json` and `application/x-www-form-urlencoded`
 - `POST /oauth/register` — RFC 7591 dynamic client registration; issues a random `client_id` with no client secret (public client model)
 
-Access tokens are HMAC-SHA256 signed with `AUTH_TOKEN` as the key, so they survive container restarts without any storage — which matters more on Cloud Run than it did on Render, since scale-to-zero means the process is routinely torn down between requests. Auth codes live in a process-level dict and are cleared on restart (clients retry the authorization flow automatically).
+**No shared server state.** Access tokens *and* authorization codes are HMAC-SHA256 signed with `AUTH_TOKEN` as the key, carrying their own payload and expiry, so nothing has to be stored between requests. This matters more on Cloud Run than it did on Render: scale-to-zero tears the process down routinely, and `--max-instances 3` means `/oauth/authorize` and `/oauth/token` — two separate requests — often don't hit the same instance at all. Auth codes previously lived in a process-level dict and broke in exactly that case.
+
+Both are signed via `_sign(purpose, data)`, whose purpose prefix is load-bearing: the two token types share an envelope, so without domain separation an authorization code would satisfy the access-token check (valid signature, unexpired `exp`) and work as a bearer token.
+
+Single-use enforcement of auth codes is therefore best-effort — `_used_auth_codes` only catches a replay landing on the same instance. PKCE is the real control, since an intercepted code is useless without the client's `code_verifier`. Strict cross-instance single-use would need shared storage (Firestore/Memorystore), which isn't worth a dependency here.
+
+`test_oauth_flow.py` covers this: it starts two independent server processes and redeems on one a code issued by the other. Run it with `python test_oauth_flow.py` (stdlib only, no test framework).
 
 **Reminders sync** is two-way between this server and Apple Reminders, brokered by `scriptable/sync-reminders.js` running in the iOS Scriptable app:
 1. Scriptable GETs `/reminders/sync` → gets pending completions/additions queued by Claude
