@@ -29,6 +29,12 @@ MCP client ──GET /oauth/authorize──▶ your server
 MCP client ──POST /oauth/token──▶ your server → bearer token
 ```
 
+That last step returns a `refresh_token` alongside the access token (see
+"Refresh tokens" below) — Google only sits in the *first* leg of this
+diagram. Once the MCP client has a refresh token, every renewal after that
+goes straight to your server's own `/oauth/token`; Google is never involved
+again until the refresh token itself expires.
+
 ### What it buys, and what it doesn't
 
 Buys: no shared secret in the connector config, access revocable per Google
@@ -239,6 +245,30 @@ gcloud logging read \
 
 This needs `roles/logging.viewer` on whatever identity runs it. Grant it before
 you need it.
+
+## Refresh tokens: why the Google login doesn't recur every hour
+
+Access tokens from `/oauth/token` are short-lived (1 hour) on purpose. What
+makes that tolerable is that the same response also carries a `refresh_token`
+(180 day TTL, rotated on every use — each refresh mints a new one and resets
+the clock). This is orthogonal to Google Sign-In: the refresh token is issued
+by *your* server, off of *your* server's own auth-code exchange, regardless
+of whether the human authenticated by typing `AUTH_TOKEN` into the form or by
+signing into Google. `_issue_auth_code` doesn't know or care which path
+produced it (Step 5 above calls the exact same function Step 2's password
+form does).
+
+The consequence: an MCP client that implements the standard OAuth refresh
+grant (`grant_type=refresh_token`) hits `/oauth/token` directly to renew,
+never `/oauth/authorize`, so the human is never redirected back through
+Google's login screen just because an hour passed. The interactive Google
+consent screen only reappears if the refresh token itself lapses — i.e. the
+connector goes unused for 180 days straight — or if the client never
+implements the refresh grant in the first place, in which case it falls back
+to the full interactive flow (through Google, if configured) every time the
+access token expires. If a connector still seems to reauthenticate hourly
+after adding Google Sign-In, check that the client is actually using the
+`refresh_token` from the token response rather than discarding it.
 
 ## Pitfalls
 
