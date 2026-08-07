@@ -86,10 +86,26 @@ try:
     check("code from A redeems on B (cross-instance)", st == 200 and "access_token" in body,
           f"status={st} body={body[:120]}")
 
-    access = ""
+    access = refresh = ""
     if st == 200:
         import json
-        access = json.loads(body)["access_token"]
+        parsed = json.loads(body)
+        access, refresh = parsed["access_token"], parsed.get("refresh_token", "")
+    check("token response includes a refresh_token", bool(refresh), f"body={body[:160]}")
+
+    # 1b. The refresh token mints a new access token, on a different instance,
+    #     without going back through /oauth/authorize — this is what lets an MCP
+    #     client stay connected past the 1-hour access token TTL.
+    st, body = req(f"http://localhost:{B}/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": refresh,
+    })
+    check("refresh_token redeems on the other instance", st == 200 and "access_token" in body,
+          f"status={st} body={body[:160]}")
+    if st == 200:
+        import json
+        refreshed = json.loads(body)
+        check("refresh grant also rotates the refresh_token",
+              bool(refreshed.get("refresh_token")) and refreshed["refresh_token"] != refresh)
 
     # 2. That access token works on either instance.
     for port, label in ((A, "A"), (B, "B")):
