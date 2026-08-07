@@ -63,6 +63,8 @@ Google Sign-In changes only the *interactive* half of the flow. `AUTH_TOKEN` rem
 
 The Google redirect URI is derived per-request (`<base>/oauth/google/callback`) and must be registered on the Google client *exactly*. The service answers on two hostnames, so register both, or set `PUBLIC_URL` to pin one.
 
+[docs/google-signin.md](docs/google-signin.md) writes up the whole setup as a reusable recipe — console steps, the signed-`state` handoff, verification via request logs, and the pitfalls. Read it before putting this in front of another service; the last one (sharing `AUTH_TOKEN` across services makes their tokens interchangeable) is easy to get wrong.
+
 Cloud Run has no equivalent of Render's `RENDER_EXTERNAL_URL` (the hostname isn't known until the first deploy, and one service answers on several), which is why `_server_url()` reads the `Host` and `X-Forwarded-Proto` headers instead of a fixed env var.
 
 ### Deployment
