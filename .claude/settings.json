@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dockerd:*)",
+      "Bash(docker build:*)",
+      "Bash(docker push:*)",
+      "Bash(docker login:*)",
+      "Bash(docker tag:*)",
+      "Bash(gcloud:*)"
+    ]
+  }
+}
