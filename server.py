@@ -98,8 +98,9 @@ REMINDERS_PATH = "_system/reminders.json"
 
 # ── OAuth constants ───────────────────────────────────────────────────────────
 
-_ACCESS_TOKEN_TTL = 3600   # 1 hour
-_AUTH_CODE_TTL    = 600    # 10 minutes
+_ACCESS_TOKEN_TTL  = 3600          # 1 hour
+_REFRESH_TOKEN_TTL = 180 * 86400   # 180 days, rotated on every use (see below)
+_AUTH_CODE_TTL     = 600           # 10 minutes
 
 # Best-effort replay guard for authorization codes, keyed by the code's jti.
 # Codes are stateless (see below), so single-use can't be enforced by deleting a
@@ -155,6 +156,26 @@ def _issue_access_token(client_id: str) -> str:
 def _verify_access_token(token: str) -> bool:
     """Return True if the token has a valid HMAC signature and is unexpired."""
     return _decode_signed("access", token) is not None
+
+
+def _issue_refresh_token(client_id: str) -> str:
+    """Return an HMAC-SHA256-signed refresh token, same stateless design as access tokens.
+
+    Long-lived (180 days) and rotated on every use: each `grant_type=refresh_token`
+    call mints a fresh one alongside the new access token, resetting the clock. A
+    client that refreshes periodically — which any MCP client that implements the
+    refresh grant does automatically on a 401 — never hits the 180-day ceiling, so
+    the only time a human sees the interactive `/oauth/authorize` form again is the
+    very first connection, not every time the 1-hour access token lapses.
+    """
+    return _encode_signed(
+        "refresh", {"sub": client_id, "jti": secrets.token_urlsafe(8)}, _REFRESH_TOKEN_TTL
+    )
+
+
+def _verify_refresh_token(token: str) -> dict | None:
+    """Return the token payload iff it has a valid HMAC signature and is unexpired."""
+    return _decode_signed("refresh", token)
 
 
 def _issue_auth_code(
@@ -869,6 +890,22 @@ async def oauth_token(request: Request) -> JSONResponse:
         code_verifier = form.get("code_verifier", "")
         redirect_uri  = form.get("redirect_uri", "")
 
+    if grant_type == "refresh_token":
+        if "application/json" in content_type:
+            refresh_token = body.get("refresh_token", "")
+        else:
+            refresh_token = form.get("refresh_token", "")
+        payload = _verify_refresh_token(refresh_token)
+        if not payload:
+            return JSONResponse({"error": "invalid_grant", "error_description": "unknown or expired refresh token"}, status_code=400)
+        client_id = payload["sub"]
+        return JSONResponse({
+            "access_token":  _issue_access_token(client_id),
+            "refresh_token": _issue_refresh_token(client_id),
+            "token_type":    "bearer",
+            "expires_in":    _ACCESS_TOKEN_TTL,
+        })
+
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
@@ -884,11 +921,11 @@ async def oauth_token(request: Request) -> JSONResponse:
     if not hmac.compare_digest(challenge, code_data["cc"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, status_code=400)
 
-    access_token = _issue_access_token(code_data["cid"])
     return JSONResponse({
-        "access_token": access_token,
-        "token_type":   "bearer",
-        "expires_in":   _ACCESS_TOKEN_TTL,
+        "access_token":  _issue_access_token(code_data["cid"]),
+        "refresh_token": _issue_refresh_token(code_data["cid"]),
+        "token_type":    "bearer",
+        "expires_in":    _ACCESS_TOKEN_TTL,
     })
 
 
@@ -908,7 +945,7 @@ async def oauth_register(request: Request) -> JSONResponse:
         "client_id":                     client_id,
         "redirect_uris":                 body.get("redirect_uris", []),
         "token_endpoint_auth_method":    "none",
-        "grant_types":                   ["authorization_code"],
+        "grant_types":                   ["authorization_code", "refresh_token"],
         "response_types":                ["code"],
     }, status_code=201)
 
@@ -946,7 +983,7 @@ async def oauth_server_metadata(request: Request) -> JSONResponse:
         "token_endpoint":                        f"{base}/oauth/token",
         "registration_endpoint":                 f"{base}/oauth/register",
         "response_types_supported":              ["code"],
-        "grant_types_supported":                 ["authorization_code"],
+        "grant_types_supported":                 ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported":      ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     })
