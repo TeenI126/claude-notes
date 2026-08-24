@@ -1,7 +1,7 @@
 """
 Claude Notes MCP Server
 FastMCP with Streamable HTTP transport (MCP spec 2025-03-26).
-Notes are stored in a GitHub repo for persistence across deploys.
+Notes are stored in a Google Cloud Storage bucket for persistence across deploys.
 Includes a two-way Apple Reminders sync system (via Scriptable on iOS).
 OAuth 2.0 authorization server with PKCE (RFC 7636) for MCP clients.
 """
@@ -20,7 +20,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from github import Github, GithubException
+from google.cloud import storage as gcs_storage
+from google.api_core.exceptions import NotFound as GcsNotFound, PreconditionFailed as GcsPreconditionFailed
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -49,8 +50,7 @@ TransportSecurityMiddleware.__init__ = _init_no_dns_rebinding
 # ── Config ────────────────────────────────────────────────────────────────────
 
 AUTH_TOKEN    = os.environ.get("AUTH_TOKEN", "")
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO   = os.environ.get("GITHUB_REPO", "")
+GCS_BUCKET    = os.environ.get("GCS_BUCKET", "")
 
 # Cloud Run has no equivalent of Render's RENDER_EXTERNAL_URL — the service's
 # hostname isn't known until after the first deploy, and one service answers on
@@ -221,10 +221,21 @@ def _consume_auth_code(code: str) -> dict | None:
 
 mcp = FastMCP("claude-notes")
 
-# ── GitHub helpers ────────────────────────────────────────────────────────────
+# ── GCS helpers ───────────────────────────────────────────────────────────────
 
-def _get_repo():
-    return Github(GITHUB_TOKEN).get_repo(GITHUB_REPO)
+# Lazily constructed and cached for the process lifetime — on Cloud Run it picks
+# up Application Default Credentials from the attached runtime service account
+# automatically; locally it needs `gcloud auth application-default login` or
+# GOOGLE_APPLICATION_CREDENTIALS pointing at a key file. Built lazily (not at
+# import time) so importing this module — e.g. from test_oauth_flow.py, which
+# never touches storage — doesn't require GCP credentials to be present.
+_gcs_client: gcs_storage.Client | None = None
+
+def _bucket():
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = gcs_storage.Client()
+    return _gcs_client.bucket(GCS_BUCKET)
 
 def _safe_filename(filename: str) -> str | None:
     """Validate a user-facing filename.  Blocks path traversal AND the
@@ -247,27 +258,32 @@ def _empty_reminders() -> dict:
         "pending_additions": [],
     }
 
-def _read_reminders(repo=None) -> tuple[dict, str | None]:
-    """Read _system/reminders.json.  Returns (data, sha).
+def _read_reminders(bucket=None) -> tuple[dict, int | None]:
+    """Read _system/reminders.json.  Returns (data, generation).
     If the file doesn't exist yet returns (empty_structure, None)."""
-    repo = repo or _get_repo()
+    bucket = bucket or _bucket()
+    blob = bucket.blob(REMINDERS_PATH)
     try:
-        contents = repo.get_contents(REMINDERS_PATH)
-        data = json.loads(contents.decoded_content.decode("utf-8"))
-        return data, contents.sha
-    except GithubException as e:
-        if e.status == 404:
-            return _empty_reminders(), None
-        raise
+        data = json.loads(blob.download_as_text())
+        return data, blob.generation
+    except GcsNotFound:
+        return _empty_reminders(), None
 
-def _write_reminders(data: dict, sha: str | None, repo=None) -> None:
-    """Create or update _system/reminders.json on GitHub."""
-    repo = repo or _get_repo()
-    blob = json.dumps(data, indent=2, ensure_ascii=False)
-    if sha:
-        repo.update_file(REMINDERS_PATH, "Update reminders", blob, sha)
-    else:
-        repo.create_file(REMINDERS_PATH, "Create reminders", blob)
+def _write_reminders(data: dict, generation: int | None, bucket=None) -> None:
+    """Create or update _system/reminders.json in GCS.
+
+    `if_generation_match` is GCS's optimistic-concurrency precondition —
+    0 means "only create if no object exists yet", any other value means
+    "only replace if this is still the generation I last read". A mismatch
+    raises GcsPreconditionFailed, the GCS analog of GitHub's 409 conflict.
+    """
+    bucket = bucket or _bucket()
+    blob = bucket.blob(REMINDERS_PATH)
+    body = json.dumps(data, indent=2, ensure_ascii=False)
+    blob.upload_from_string(
+        body, content_type="application/json; charset=utf-8",
+        if_generation_match=generation if generation is not None else 0,
+    )
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -278,12 +294,14 @@ def _now_iso() -> str:
 async def list_files() -> str:
     """List all your note files."""
     def _run():
-        repo = _get_repo()
-        contents = repo.get_contents("")
-        files = sorted([c for c in contents if c.type == "file"], key=lambda x: x.name)
+        bucket = _bucket()
+        files = sorted(
+            (b for b in bucket.list_blobs() if not b.name.startswith("_system/")),
+            key=lambda b: b.name,
+        )
         if not files:
             return "No files yet."
-        return "\n".join(f"{c.name}  ({c.size} bytes)" for c in files)
+        return "\n".join(f"{b.name}  ({b.size} bytes)" for b in files)
     return await asyncio.to_thread(_run)
 
 
@@ -295,11 +313,9 @@ async def read_file(filename: str) -> str:
         return "Error: invalid filename."
     def _run():
         try:
-            return _get_repo().get_contents(name).decoded_content.decode("utf-8")
-        except GithubException as e:
-            if e.status == 404:
-                return f"Error: '{name}' does not exist."
-            raise
+            return _bucket().blob(name).download_as_text()
+        except GcsNotFound:
+            return f"Error: '{name}' does not exist."
     return await asyncio.to_thread(_run)
 
 
@@ -310,15 +326,7 @@ async def write_file(filename: str, content: str) -> str:
     if name is None:
         return "Error: invalid filename."
     def _run():
-        repo = _get_repo()
-        try:
-            existing = repo.get_contents(name)
-            repo.update_file(name, f"Update {name}", content, existing.sha)
-        except GithubException as e:
-            if e.status == 404:
-                repo.create_file(name, f"Create {name}", content)
-            else:
-                raise
+        _bucket().blob(name).upload_from_string(content, content_type="text/plain; charset=utf-8")
         return f"Written {len(content)} chars to '{name}'."
     return await asyncio.to_thread(_run)
 
@@ -330,16 +338,12 @@ async def append_to_file(filename: str, content: str) -> str:
     if name is None:
         return "Error: invalid filename."
     def _run():
-        repo = _get_repo()
+        blob = _bucket().blob(name)
         try:
-            existing = repo.get_contents(name)
-            current = existing.decoded_content.decode("utf-8")
-            repo.update_file(name, f"Append to {name}", current + content, existing.sha)
-        except GithubException as e:
-            if e.status == 404:
-                repo.create_file(name, f"Create {name}", content)
-            else:
-                raise
+            current = blob.download_as_text()
+        except GcsNotFound:
+            current = ""
+        blob.upload_from_string(current + content, content_type="text/plain; charset=utf-8")
         return f"Appended to '{name}'."
     return await asyncio.to_thread(_run)
 
@@ -351,15 +355,11 @@ async def delete_file(filename: str) -> str:
     if name is None:
         return "Error: invalid filename."
     def _run():
-        repo = _get_repo()
         try:
-            existing = repo.get_contents(name)
-            repo.delete_file(name, f"Delete {name}", existing.sha)
+            _bucket().blob(name).delete()
             return f"Deleted '{name}'."
-        except GithubException as e:
-            if e.status == 404:
-                return f"Error: '{name}' does not exist."
-            raise
+        except GcsNotFound:
+            return f"Error: '{name}' does not exist."
     return await asyncio.to_thread(_run)
 
 # ── Reminder MCP tools ───────────────────────────────────────────────────────
@@ -463,7 +463,7 @@ async def add_reminder(
 
     def _run():
         for attempt in range(2):
-            data, sha = _read_reminders()
+            data, generation = _read_reminders()
             server_id = f"claude-{uuid.uuid4().hex[:8]}"
             data["pending_additions"].append({
                 "server_id": server_id,
@@ -475,10 +475,10 @@ async def add_reminder(
                 "created_at": _now_iso(),
             })
             try:
-                _write_reminders(data, sha)
+                _write_reminders(data, generation)
                 return f"Reminder added: '{title}' (ID: {server_id}). It will appear in Apple Reminders after the next sync."
-            except GithubException as e:
-                if e.status == 409 and attempt == 0:
+            except GcsPreconditionFailed:
+                if attempt == 0:
                     continue
                 raise
 
@@ -492,7 +492,7 @@ async def complete_reminder(identifier: str) -> str:
     synced yet it's simply removed."""
     def _run():
         for attempt in range(2):
-            data, sha = _read_reminders()
+            data, generation = _read_reminders()
 
             # Case 1: reminder is in the synced dict (came from Apple)
             if identifier in data["reminders"]:
@@ -503,10 +503,10 @@ async def complete_reminder(identifier: str) -> str:
                     "completed_by": "claude",
                 })
                 try:
-                    _write_reminders(data, sha)
+                    _write_reminders(data, generation)
                     return f"Reminder '{title}' marked complete. It will be completed in Apple Reminders after the next sync."
-                except GithubException as e:
-                    if e.status == 409 and attempt == 0:
+                except GcsPreconditionFailed:
+                    if attempt == 0:
                         continue
                     raise
 
@@ -516,10 +516,10 @@ async def complete_reminder(identifier: str) -> str:
                     title = pa["title"]
                     data["pending_additions"].pop(i)
                     try:
-                        _write_reminders(data, sha)
+                        _write_reminders(data, generation)
                         return f"Reminder '{title}' removed (it hadn't synced to Apple yet)."
-                    except GithubException as e:
-                        if e.status == 409 and attempt == 0:
+                    except GcsPreconditionFailed:
+                        if attempt == 0:
                             break  # retry outer loop
                         raise
 
@@ -1001,15 +1001,7 @@ async def rest_write(request: Request) -> JSONResponse:
     if not filename:
         return JSONResponse({"error": "missing or invalid filename"}, status_code=400)
     def _run():
-        repo = _get_repo()
-        try:
-            existing = repo.get_contents(filename)
-            repo.update_file(filename, f"Update {filename}", content, existing.sha)
-        except GithubException as e:
-            if e.status == 404:
-                repo.create_file(filename, f"Create {filename}", content)
-            else:
-                raise
+        _bucket().blob(filename).upload_from_string(content, content_type="text/plain; charset=utf-8")
         return f"Written {len(content)} chars to '{filename}'."
     result = await asyncio.to_thread(_run)
     return JSONResponse({"ok": True, "detail": result})
@@ -1051,7 +1043,7 @@ async def reminders_sync_post(request: Request) -> JSONResponse:
 
     def _run():
         for attempt in range(2):
-            data, sha = _read_reminders()
+            data, generation = _read_reminders()
 
             # 1. Clear confirmed completions
             data["pending_completions"] = [
@@ -1090,15 +1082,15 @@ async def reminders_sync_post(request: Request) -> JSONResponse:
             data["last_sync_at"] = _now_iso()
 
             try:
-                _write_reminders(data, sha)
+                _write_reminders(data, generation)
                 return {
                     "ok":                            True,
                     "reminder_count":                len(new_reminders),
                     "pending_completions_remaining": len(data["pending_completions"]),
                     "pending_additions_remaining":   len(data["pending_additions"]),
                 }
-            except GithubException as e:
-                if e.status == 409 and attempt == 0:
+            except GcsPreconditionFailed:
+                if attempt == 0:
                     continue
                 raise
 
@@ -1155,6 +1147,12 @@ def _require_auth_token() -> None:
             "AUTH_TOKEN is not set — refusing to start.\n"
             "On Cloud Run it comes from the claude-notes-auth-token secret; "
             "locally, pass AUTH_TOKEN=dev."
+        )
+
+    if not GCS_BUCKET:
+        raise SystemExit(
+            "GCS_BUCKET is not set — refusing to start.\n"
+            "It names the Cloud Storage bucket notes and reminders are stored in."
         )
 
     # A Google client with no allowlist would let *any* Google account through,

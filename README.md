@@ -43,9 +43,7 @@ On each sync run the Scriptable script:
 2. Place `config.json` in your Scriptable iCloud folder with your auth token:
    ```json
    {
-     "AUTH_TOKEN":   "your-server-auth-token",
-     "GITHUB_TOKEN": "your-github-pat",
-     "GITHUB_REPO":  "your-username/myclaude"
+     "AUTH_TOKEN": "your-server-auth-token"
    }
    ```
 3. Copy `scriptable/sync-reminders.js` into your Scriptable iCloud folder — it appears in the app automatically
@@ -83,7 +81,7 @@ After each sync a notification confirms how many reminders were active, complete
 
 ## Notes
 
-- Notes and reminders are stored in a private GitHub repo — data persists across deploys, and Cloud Run's stateless containers keep no local state of their own
+- Notes and reminders are stored in a private Google Cloud Storage bucket — data persists across deploys, and Cloud Run's stateless containers keep no local state of their own
 - The service scales to zero, so expect a cold start of a few seconds if it hasn't been used recently
 - Filenames starting with `.` or `_system` are blocked; everything else is allowed
 - All files live flat in one folder — no directory traversal is possible
