@@ -6,14 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pip install -r requirements.txt
-AUTH_TOKEN=dev GITHUB_TOKEN=ghp_... GITHUB_REPO=user/repo python server.py
+gcloud auth application-default login   # one-time, so the GCS client can authenticate locally
+AUTH_TOKEN=dev GCS_BUCKET=your-bucket-name python server.py
 ```
 
 The server starts on port 8000 by default (overridden by `PORT` env var). The MCP endpoint is mounted at `/mcp`, health check at `/health`.
 
 ## Architecture
 
-This is a single-file FastMCP server (`server.py`) deployed on Google Cloud Run. There is no database — all notes and reminder state are stored as files in a **separate private GitHub repo** (configured via `GITHUB_REPO` env var). `PyGithub` is the only storage layer. Cloud Run containers are stateless and scale to zero, so nothing may be kept on local disk.
+This is a single-file FastMCP server (`server.py`) deployed on Google Cloud Run. There is no database — all notes and reminder state are stored as objects in a **Google Cloud Storage bucket** (configured via `GCS_BUCKET` env var). `google-cloud-storage` is the only storage layer, authenticated via Application Default Credentials — on Cloud Run that's the runtime service account attached to the revision, no key file involved. Cloud Run containers are stateless and scale to zero, so nothing may be kept on local disk.
+
+Notes and reminders used to live in a separate private GitHub repo, read/written via `PyGithub`. That was migrated to GCS (bucket `a111-502600-claude-notes-data`, versioning enabled) because Cloud Run's own least-privilege deploy service account (`claude@a111-502600.iam.gserviceaccount.com`, see the `gcp-deploy` skill) already carries `roles/storage.admin` and is also this service's runtime identity — GCS needs no separate credential to be minted, stored, or rotated the way a GitHub PAT does.
 
 ### Key design points
 
@@ -43,9 +46,9 @@ Single-use enforcement of auth codes is therefore best-effort — `_used_auth_co
 **Reminders sync** is two-way between this server and Apple Reminders, brokered by `scriptable/sync-reminders.js` running in the iOS Scriptable app:
 1. Scriptable GETs `/reminders/sync` → gets pending completions/additions queued by Claude
 2. Scriptable applies them on device, then POSTs the full current reminder state back
-3. Server overwrites `_system/reminders.json` in the GitHub repo with the fresh state
+3. Server overwrites `_system/reminders.json` in the GCS bucket with the fresh state
 
-The reminders JSON file is the single source of truth; concurrent writes are handled with a simple 2-attempt retry on GitHub 409 conflicts.
+The reminders JSON file is the single source of truth; concurrent writes are handled with a simple 2-attempt retry on `GcsPreconditionFailed` (GCS's `if_generation_match` optimistic-concurrency precondition — the object's `generation` number stands in for GitHub's blob `sha`; `if_generation_match=0` means "only create if nothing exists yet").
 
 **Filename safety**: `_safe_filename()` blocks path traversal, dotfiles, and the `_system/` prefix (reserved for internal state like `reminders.json`).
 
@@ -54,8 +57,7 @@ The reminders JSON file is the single source of truth; concurrent writes are han
 | Variable | Purpose |
 |---|---|
 | `AUTH_TOKEN` | Static bearer token for all endpoints |
-| `GITHUB_TOKEN` | PAT for reading/writing the notes data repo |
-| `GITHUB_REPO` | `owner/repo` of the private data repository |
+| `GCS_BUCKET` | Name of the Cloud Storage bucket notes and reminders are stored in |
 | `PUBLIC_URL` | Optional. Pins the base URL in the OAuth metadata responses. Leave unset on Cloud Run — the metadata endpoints derive it per-request from the `Host` header, so the base URL, the `preview---` tag URL, and any custom domain each advertise themselves correctly. |
 | `PORT` | HTTP port. Cloud Run injects `8080`; defaults to 8000 locally. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Optional. A Google OAuth **Web application** client. Set both or neither. When set with an allowlist, the token form is replaced by a Google login and the form POST is disabled. |
@@ -71,6 +73,6 @@ Cloud Run has no equivalent of Render's `RENDER_EXTERNAL_URL` (the hostname isn'
 
 ### Deployment
 
-Deployed to Cloud Run as service `claude-notes-prod` in `us-central1` (GCP project `a111-502600`), built from source with Google Buildpacks. `Procfile` supplies the start command, because Buildpacks' Python detector only auto-discovers `main.py`/`app.py` and this project's entrypoint is `server.py`. `.gcloudignore` controls what gets uploaded into the build context — note that it fully replaces `.gitignore` for that purpose.
+Deployed to Cloud Run as service `claude-notes-prod` in `us-central1` (GCP project `a111-502600`), runtime identity `claude@a111-502600.iam.gserviceaccount.com`. `Procfile` supplies the start command for a Buildpacks build (`gcloud run deploy --source .`), because Buildpacks' Python detector only auto-discovers `main.py`/`app.py` and this project's entrypoint is `server.py`. A `Dockerfile` is also checked in as a known-good fallback for the Cloud Build/Cloud Run v2 REST deploy path (no `gcloud` CLI, no local Docker) used from restricted/ephemeral sandboxes — see the `gcp-deploy` skill's REST path. `.gcloudignore` controls what gets uploaded into the build context — note that it fully replaces `.gitignore` for that purpose.
 
-`AUTH_TOKEN` and `GITHUB_TOKEN` are mounted from Secret Manager (`claude-notes-auth-token`, `claude-notes-github-token`); `GITHUB_REPO` is a plain env var. Deploys go to a `preview`-tagged revision with no traffic first, then a separate `--promote` step moves traffic.
+`AUTH_TOKEN` is mounted from Secret Manager (`claude-notes-auth-token`); `GCS_BUCKET` is a plain env var (`a111-502600-claude-notes-data`). No credential needs to be minted or rotated for GCS access — the runtime service account already carries `roles/storage.admin`. Deploys go to a `preview`-tagged revision with no traffic first, then a separate `--promote` step moves traffic.

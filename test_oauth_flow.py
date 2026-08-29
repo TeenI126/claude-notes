@@ -12,7 +12,7 @@ A, B = 8201, 8202
 
 
 def start(port):
-    env = dict(os.environ, AUTH_TOKEN=TOKEN, PORT=str(port), GITHUB_REPO="x/y", GITHUB_TOKEN="z")
+    env = dict(os.environ, AUTH_TOKEN=TOKEN, PORT=str(port), GCS_BUCKET="test-bucket")
     p = subprocess.Popen([sys.executable, "server.py"], env=env, cwd=REPO,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(80):
